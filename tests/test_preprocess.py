@@ -68,3 +68,33 @@ def test_clipped_samples_are_dropped():
     assert np.isnan(channel.values[:SAMPLES_PER_PACKET]).all()
     assert np.isfinite(channel.values[SAMPLES_PER_PACKET:]).all()
     assert channel.stats()["clipped_samples"] == SAMPLES_PER_PACKET
+
+
+def test_reconnect_resets_the_sequence_without_squeezing_the_timeline():
+    """A reconnect used to drag the least squares fit off by 20 %."""
+    first = _packets(100)
+    gap_s = 30.0
+    second = [(timestamp + gap_s, payload) for timestamp, payload in _packets(100)]
+    channel = decode(first + second, int(Handle.PCM1_DATA), RATE, SAMPLES_PER_PACKET, "test")
+
+    assert channel.sessions == 2
+    assert channel.sample_rate_hz == pytest.approx(140.0, abs=0.5)
+    assert channel.gap_s > gap_s - 100 * SAMPLES_PER_PACKET / RATE
+    assert channel.packets == 200
+    # Both sessions are decoded in full; the reconnect only leaves NaNs.
+    assert np.isfinite(channel.values).sum() == 200 * SAMPLES_PER_PACKET
+    assert channel.values.size > 200 * SAMPLES_PER_PACKET
+    finite = channel.values[np.isfinite(channel.values)]
+    assert finite[0] == 1000
+    assert finite[-1] == 1000 + 100 * SAMPLES_PER_PACKET - 1  # second session restarts
+
+
+def test_duplicate_notifications_are_dropped():
+    """Old recorders added their callback once per reconnect, duplicating packets."""
+    records = _packets(100)
+    duplicated = [record for record in records for _ in range(3)]
+    channel = decode(duplicated, int(Handle.PCM1_DATA), RATE, SAMPLES_PER_PACKET, "test")
+    assert channel.packets == 100
+    assert channel.values.size == 100 * SAMPLES_PER_PACKET
+    assert channel.sample_rate_hz == pytest.approx(140.0, abs=0.5)
+    assert np.isfinite(channel.values).all()

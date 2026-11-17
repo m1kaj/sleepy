@@ -22,6 +22,7 @@ from .protocol.constants import (
     CONTROL_START,
     PCM1_SAMPLES_PER_PACKET,
     PCM2_SAMPLES_PER_PACKET,
+    UUID,
     Handle,
 )
 from .protocol.packets import describe, parse
@@ -202,7 +203,7 @@ def listen(
                 if not no_command:
                     await _try_command(session, command_handle, command_value)
                 await asyncio.sleep(seconds)
-                await session.client.stop_notify(char.handle)
+                await session.client.stop_notify(char)
         else:
             await session.enable_notifications([c.handle for c in targets])
             if not no_command:
@@ -210,6 +211,7 @@ def listen(
             typer.echo(f"Listening for {seconds:.0f} s...")
             await asyncio.sleep(seconds)
 
+        session.remove_callback(on_data)
         if log is not None:
             log.close()
         await session.disconnect()
@@ -455,87 +457,195 @@ def record(
     address: Optional[str] = typer.Option(None, "--address", "-a"),
     duration: Optional[float] = typer.Option(None, "--duration", "-d", help="Stop after N seconds."),
     stall_timeout: float = typer.Option(
-        20.0, "--stall-timeout", help="Re-arm the sensor after this many seconds without data."
+        10.0, "--stall-timeout", help="Reconnect after this many seconds without PCM data."
     ),
     flush_every: float = typer.Option(5.0, "--flush-every", help="Flush the log every N seconds."),
+    notify: str = typer.Option(
+        "measurement",
+        "--notify",
+        help="Notifications to record: 'measurement' (PCM1+PCM2, what the phone app uses) or 'all'.",
+    ),
+    scan_timeout: float = typer.Option(
+        6.0, "--scan-timeout", help="How long to scan for the sensor when reconnecting."
+    ),
     timeout: float = typer.Option(30.0, "--timeout"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Record overnight: keep the stream alive, re-arming and reconnecting as needed."""
+    """Record overnight: keep the stream alive, reconnecting as soon as the link drops."""
     _setup_logging(verbose)
+    if notify not in ("measurement", "all"):
+        raise typer.BadParameter("must be 'measurement' or 'all'", param_hint="--notify")
 
     async def run() -> dict:
         session = BedditSession(_resolve_address(address), timeout=timeout)
         await session.connect()
-        info = await session.sensor_info()
+        if session.address:
+            _remember_device(session.address, None)
         log = rawlog.RawLogWriter(
             out or RAW_DIR / f"night_{session.address.replace(':', '')}_{_stamp()}.bin"
         )
+        events_path = log.path.with_suffix(".events.jsonl")
+        meta_path = log.path.with_suffix(".json")
+
+        def emit(event: str, **fields: object) -> None:
+            entry = {
+                "at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "event": event,
+                **fields,
+            }
+            with events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry) + "\n")
+
+        try:
+            info = await session.sensor_info()
+        except Exception as error:  # noqa: BLE001 - keep recording even if a read fails
+            info = {"error": f"{type(error).__name__}: {error}"}
         meta = {
             "address": session.address,
             "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "sensor": info,
             "raw_log": str(log.path),
+            "events_log": str(events_path),
+            "notify": notify,
         }
-        log.path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+        meta_path.write_text(json.dumps(meta, indent=2))
+        emit("started", address=session.address, notify=notify)
 
-        state = {"last_packet": time.monotonic(), "last_flush": time.monotonic(), "stalls": 0}
+        state = {
+            "last_pcm": time.monotonic(),
+            "last_flush": time.monotonic(),
+            "last_connect": time.monotonic(),
+            "stalls": 0,
+            "gap_started": None,
+        }
 
         def on_data(handle: int, payload: bytes, timestamp: float) -> None:
-            log.write(handle, payload)
-            state["last_packet"] = time.monotonic()
+            log.write(handle, payload, timestamp_ns=int(timestamp * 1_000_000_000))
+            if handle in (int(Handle.PCM1_DATA), int(Handle.PCM2_DATA)):
+                state["last_pcm"] = time.monotonic()
 
+        # Registered exactly once: callbacks survive reconnects in BedditSession,
+        # so adding it again after every reconnect would duplicate every packet.
         session.add_callback(on_data)
-        await session.enable_notifications()
-        await session.start_stream()
 
-        started = time.monotonic()
+        if notify == "measurement":
+            # Resolved again on every reconnect: the GATT table is stable, but
+            # this keeps arm() independent of the first connection's objects.
+            def notification_handles() -> list[int] | None:
+                return [
+                    session.characteristic_by_uuid(UUID.PCM1_DATA).handle,
+                    session.characteristic_by_uuid(UUID.PCM2_DATA).handle,
+                ]
+        else:
+            def notification_handles() -> list[int] | None:
+                return None
+
+        async def arm() -> None:
+            await session.enable_notifications(notification_handles())
+            await session.start_stream()
+            state["last_pcm"] = time.monotonic()
+
+        async def reconnect(reason: str, deadline: float | None) -> bool:
+            """Reconnect until it works or the requested duration runs out."""
+            state["stalls"] += 1
+            uptime = time.monotonic() - state["last_connect"]
+            state["gap_started"] = time.monotonic()
+            log.flush()
+            LOGGER.warning("%s after %.1f s; reconnecting", reason, uptime)
+            emit("link_lost", reason=reason, uptime_s=round(uptime, 1))
+            attempt = 0
+            while deadline is None or time.monotonic() < deadline:
+                attempt += 1
+                try:
+                    await session.disconnect()
+                    await session.connect(scan_timeout=scan_timeout, retries=1)
+                    await arm()
+                except Exception as error:  # noqa: BLE001 - retry forever
+                    delay = min(0.5 * attempt, 5.0)
+                    LOGGER.warning(
+                        "Reconnect attempt %d failed: %s (retrying in %.1f s)",
+                        attempt,
+                        error,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                gap = time.monotonic() - state["gap_started"]
+                state["last_connect"] = time.monotonic()
+                state["gap_started"] = None
+                LOGGER.info("Recording again after a %.1f s gap", gap)
+                emit("reconnected", gap_s=round(gap, 1), attempt=attempt)
+                return True
+            return False
+
         try:
+            try:
+                await arm()
+            except Exception as error:  # noqa: BLE001 - startup is retried like any link loss
+                LOGGER.warning("Could not start the stream (%s); retrying", error)
+                await reconnect("initial start failed", None)
+            started = time.monotonic()
+            state["last_connect"] = started
+            deadline = started + duration if duration is not None else None
+            LOGGER.info(
+                "Recording %s notification(s) to %s",
+                "all" if notify == "all" else "PCM1+PCM2",
+                log.path,
+            )
             while True:
-                await asyncio.sleep(1.0)
                 now = time.monotonic()
-                if duration is not None and now - started >= duration:
+                if deadline is not None and now >= deadline:
                     break
                 if now - state["last_flush"] >= flush_every:
                     log.flush()
                     state["last_flush"] = now
-                if now - state["last_packet"] >= stall_timeout:
-                    state["stalls"] += 1
-                    LOGGER.warning(
-                        "No data for %.0f s (stall %d); re-arming the sensor",
-                        now - state["last_packet"],
-                        state["stalls"],
-                    )
-                    try:
-                        await session.start_stream()
-                    except Exception as error:  # noqa: BLE001
-                        LOGGER.warning("Re-arm failed: %s", error)
-                    state["last_packet"] = now
-                    if state["stalls"] % 3 == 0:
-                        LOGGER.warning("Reconnecting...")
-                        try:
-                            await session.disconnect()
-                        except Exception:  # noqa: BLE001
-                            pass
-                        await session.connect()
-                        session.add_callback(on_data)
-                        await session.enable_notifications()
-                        await session.start_stream()
-                        state["last_packet"] = time.monotonic()
+                if not session.is_connected:
+                    if not await reconnect("link lost", deadline):
+                        break
+                    continue
+                silence = now - state["last_pcm"]
+                if silence >= stall_timeout:
+                    if not await reconnect(f"no PCM data for {silence:.0f} s", deadline):
+                        break
+                    continue
+                await asyncio.sleep(0.5)
         finally:
             LOGGER.info("Stopping; %d packets written to %s", log.records, log.path)
+            # Remove the callback before closing the log: stop_stream() and the
+            # disconnect can still deliver one last notification, and writing it
+            # to a closed file raises inside bleak's D-Bus handler.
+            session.remove_callback(on_data)
             log.close()
+            emit("stopped", packets=log.records, reconnects=state["stalls"])
             with contextlib.suppress(Exception):
-                await session.stop_stream()
+                if session.is_connected:
+                    await session.stop_stream()
             await session.disconnect()
-        return {"packets": log.records, "path": str(log.path), "stalls": state["stalls"]}
+            meta.update(
+                {
+                    "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "packets": log.records,
+                    "sessions": session.connections,
+                    "reconnects": state["stalls"],
+                }
+            )
+            meta_path.write_text(json.dumps(meta, indent=2))
+        return {
+            "packets": log.records,
+            "path": str(log.path),
+            "stalls": state["stalls"],
+            "sessions": session.connections,
+        }
 
     try:
         result = asyncio.run(run())
     except KeyboardInterrupt:
         typer.echo("\nStopped by user.")
         return
-    typer.echo(f"Recorded {result['packets']} packets to {result['path']} ({result['stalls']} stalls)")
+    typer.echo(
+        f"Recorded {result['packets']} packets to {result['path']} "
+        f"in {result['sessions']} session(s) ({result['stalls']} reconnect(s))"
+    )
 
 
 @app.command()
@@ -597,8 +707,9 @@ def process(
     )
 
     typer.echo(
-        f"Decoded {channel.values.size} samples at {channel.sample_rate_hz:.2f} Hz "
-        f"({channel.duration_s:.0f} s, packet loss {channel.loss_ratio:.2%})"
+        f"Decoded {channel.valid.size} samples at {channel.sample_rate_hz:.2f} Hz "
+        f"({channel.duration_s:.0f} s, packet loss {channel.loss_ratio:.2%}, "
+        f"{channel.sessions} session(s), {channel.gap_s:.0f} s without data)"
     )
     for key, value in summary.items():
         typer.echo(f"  {key:<24} {value}")
@@ -613,17 +724,19 @@ def report(
     nights_dir: Path = typer.Option(DATA_DIR / "nights", "--dir", help="Where processed nights live."),
 ) -> None:
     """Build self contained HTML reports (no server needed)."""
-    targets = [night] if night else [p for p in nights_dir.iterdir() if p.is_dir()]
+    targets = [night] if night else (
+        [p for p in nights_dir.iterdir() if p.is_dir()] if nights_dir.exists() else []
+    )
     built = []
     for target in targets:
         if not (target / "summary.json").exists():
             typer.echo(f"skipping {target}: no summary.json (run 'process' first)")
             continue
         built.append(html.render_night(target))
-    index = html.render_index(nights_dir)
     for path in built:
         typer.echo(f"Wrote {path}")
-    typer.echo(f"Wrote {index}")
+    if nights_dir.exists():
+        typer.echo(f"Wrote {html.render_index(nights_dir)}")
 
 
 if __name__ == "__main__":

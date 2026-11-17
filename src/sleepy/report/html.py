@@ -65,6 +65,8 @@ def render_night(night_dir: Path) -> Path:
         "duration": f"{summary.get('duration_s', 0) / 60:.1f} min",
         "sample rate": f"{summary.get('sample_rate_hz', 0):.2f} Hz",
         "packet loss": summary.get("packet_loss", ""),
+        "sessions": channel.get("sessions", ""),
+        "time without data": f"{channel.get('gap_s', 0) / 60:.1f} min",
         "clipped samples": channel.get("clipped_samples", ""),
     }
     facts.update({k: v for k, v in night_summary.items()})

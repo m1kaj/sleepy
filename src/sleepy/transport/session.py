@@ -31,6 +31,7 @@ DEFAULT_COMMAND_HANDLE = int(Handle.CONTROL_POINT)
 DEFAULT_COMMAND_VALUE = CONTROL_START
 
 NotifyCallback = Callable[[int, bytes, float], None]
+DisconnectCallback = Callable[[], None]
 
 
 @dataclass
@@ -81,6 +82,7 @@ class BedditSession:
         address: str | None = None,
         adapter: str | None = None,
         timeout: float = 30.0,
+        disconnected_callback: DisconnectCallback | None = None,
     ) -> None:
         self.address = address
         self.adapter = adapter
@@ -88,6 +90,20 @@ class BedditSession:
         self.client: BleakClient | None = None
         self.stats = NotificationStats()
         self._callbacks: list[NotifyCallback] = []
+        self._disconnected_callback = disconnected_callback
+        self._notified: set[int] = set()
+        self._closing = False
+        self.connections = 0
+        #: Set as soon as BlueZ reports the link down. The recorder waits on it
+        #: instead of discovering the loss through a 20 s notification timeout.
+        self.disconnected = asyncio.Event()
+        #: Cached BlueZ device. Reusing it lets us reconnect without scanning
+        #: (the sensor stops advertising while it is connected).
+        self.device = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self.client is not None and self.client.is_connected
 
     # -- connection ---------------------------------------------------------
 
@@ -97,38 +113,104 @@ class BedditSession:
         BlueZ forgets devices it has not bonded, so we look the device up
         immediately before connecting and retry a couple of times; connecting
         straight to a stale D-Bus path fails with "device not found".
+
+        On a reconnect the cached :class:`BLEDevice` is reused, so BlueZ can
+        page the sensor directly instead of waiting for it to advertise again.
+        If that fails (the D-Bus object is gone), we fall back to a scan.
         """
         if self.address is None:
-            device = await find_beddit(timeout=scan_timeout)
-            self.address = device.address
-            LOGGER.info("Using discovered sensor %s (%s)", device.name, device.address)
+            found = await find_beddit(timeout=scan_timeout)
+            self.address = found.address
+            self.device = found.ble_device
+            LOGGER.info("Using discovered sensor %s (%s)", found.name, found.address)
 
         last_error: Exception | None = None
         for attempt in range(1, retries + 1):
-            device = await BleakScanner.find_device_by_address(self.address, timeout=scan_timeout)
+            device = self.device
+            if device is None:
+                device = await BleakScanner.find_device_by_address(
+                    self.address, timeout=scan_timeout
+                )
             if device is None:
                 last_error = RuntimeError(f"{self.address} not found by scanner")
                 LOGGER.warning("Attempt %d/%d: %s", attempt, retries, last_error)
                 await asyncio.sleep(1.0)
                 continue
             LOGGER.info("Connecting to %s (attempt %d/%d)", self.address, attempt, retries)
-            self.client = BleakClient(device, timeout=self.timeout)
+            client = BleakClient(
+                device,
+                timeout=self.timeout,
+                disconnected_callback=self._on_disconnect,
+            )
             try:
-                await self.client.connect()
+                await client.connect()
             except Exception as error:  # noqa: BLE001 - retried below
                 last_error = error
                 LOGGER.warning("Attempt %d/%d failed: %s", attempt, retries, error)
+                # A cached BlueZ path can disappear; scan again next time.
+                self.device = None
                 await asyncio.sleep(1.0)
                 continue
-            LOGGER.info("Connected; MTU = %s", self.client.mtu_size)
+            self.client = client
+            self.device = device
+            self._notified.clear()
+            self.disconnected.clear()
+            self.connections += 1
+            LOGGER.info("Connected; MTU = %s", client.mtu_size)
             return self.address
 
         raise RuntimeError(f"Could not connect to {self.address}: {last_error}")
 
+    def _on_disconnect(self, _client: object | None = None) -> None:
+        """Called by bleak (from the event loop) when the link goes down."""
+        if not self._closing:
+            LOGGER.warning("Sensor disconnected")
+        self.disconnected.set()
+        if self._disconnected_callback is not None:
+            try:
+                self._disconnected_callback()
+            except Exception:  # noqa: BLE001 - a callback must not kill the loop
+                LOGGER.exception("Disconnect callback failed")
+
     async def disconnect(self) -> None:
-        if self.client is not None and self.client.is_connected:
-            await self.client.disconnect()
+        """Close the link, ignoring errors from a link that already died.
+
+        ``bleak.BleakClient.disconnect()`` must be called even when the client
+        already reports ``is_connected == False``.  bleak only releases its
+        private D-Bus connection in ``disconnect()``; if an unexpected link
+        loss short-circuits this, the old client's ``StartNotify`` subscriptions
+        stay alive in BlueZ.  The next connection then receives every
+        notification twice, which is exactly the 2x packet rate seen after a
+        reconnect in the 15 minute capture.
+        """
+        self._closing = True
+        client, self.client = self.client, None
+        if client is None:
+            self._notified.clear()
+            self._closing = False
+            return
+        try:
+            if client.is_connected and client.services is not None:
+                # Best effort: explicitly remove subscriptions while the link
+                # is still up.  A failure here must not prevent the bus release.
+                for handle in list(self._notified):
+                    characteristic = client.services.get_characteristic(handle)
+                    if characteristic is None:
+                        continue
+                    try:
+                        await client.stop_notify(characteristic)
+                    except Exception:  # noqa: BLE001 - link may already be gone
+                        pass
+            # This must run unconditionally: bleak releases its private D-Bus
+            # connection here.  Skipping it when is_connected is already False
+            # leaves the old StartNotify subscriptions alive in BlueZ.
+            await client.disconnect()
             LOGGER.info("Disconnected")
+        except Exception as error:  # noqa: BLE001 - shutting down
+            LOGGER.debug("Disconnect failed: %s", error)
+        finally:
+            self._notified.clear()
+            self._closing = False
 
     async def __aenter__(self) -> BedditSession:
         await self.connect()
@@ -224,8 +306,18 @@ class BedditSession:
     # -- data flow ----------------------------------------------------------
 
     def add_callback(self, callback: NotifyCallback) -> None:
-        """Register a callback invoked as ``callback(handle, payload, timestamp)``."""
+        """Register a callback invoked as ``callback(handle, payload, timestamp)``.
+
+        Callbacks survive reconnects and are de-duplicated by identity: older
+        recorders added the same callback again after every reconnect, so each
+        notification was written two, three, ... times to the raw log.
+        """
+        if any(existing is callback for existing in self._callbacks):
+            return
         self._callbacks.append(callback)
+
+    def remove_callback(self, callback: NotifyCallback) -> None:
+        self._callbacks = [existing for existing in self._callbacks if existing is not callback]
 
     def _dispatch(self, char, data: bytearray) -> None:
         timestamp = time.time()
@@ -243,7 +335,11 @@ class BedditSession:
             targets = [c for c in targets if c.handle in handles]
         enabled = []
         for char in targets:
+            if char.handle in self._notified:
+                enabled.append(char.handle)
+                continue
             await client.start_notify(char, self._dispatch)
+            self._notified.add(char.handle)
             enabled.append(char.handle)
             LOGGER.info("Notifications enabled on 0x%04x (%s)", char.handle, char.uuid)
         return enabled

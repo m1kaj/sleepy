@@ -100,8 +100,12 @@ def estimate_rate(
     finite = values[np.isfinite(values)]
     if finite.size < 16:
         return None, 0.0
-    detrended = finite - finite.mean()
-    if np.allclose(detrended, 0):
+    # A reconnect leaves a NaN gap. Interpolating across it would silently
+    # squeeze or stretch the rhythm, so refuse windows that straddle a big gap.
+    if finite.size / values.size < 0.95:
+        return None, 0.0
+    detrended = values - finite.mean()
+    if np.allclose(detrended[np.isfinite(detrended)], 0):
         return None, 0.0
     filtered = bandpass(detrended, fs, *band)
     if not np.isfinite(filtered).all() or np.nanstd(filtered) <= 0:
@@ -197,12 +201,17 @@ def quietest_window(
     step = max(int(step_s * fs), 1)
     best_index = 0
     best_score = float("inf")
+    fallback = 0
     for start in range(0, max(int(span_s * fs) - window, 1), step):
-        score = movement_index(values[start : start + window], fs)
+        candidate = values[start : start + window]
+        if np.isfinite(candidate).mean() < 0.95:
+            continue
+        fallback = start
+        score = movement_index(candidate, fs)
         if np.isfinite(score) and score < best_score:
             best_score = score
             best_index = start
-    return values[best_index : best_index + window]
+    return values[best_index : best_index + window] if best_score < float("inf") else values[fallback:]
 
 
 def _occupied_span(
@@ -254,7 +263,6 @@ def process_channel(
         movement_limit = float(np.nanmedian(movements) * 3.0 + 1.0)
     movement_limit = movement_limit or float("inf")
 
-    start = float(times[0])
     for index, offset in enumerate(range(0, span, step)):
         epoch_values = values[offset : offset + step]
         if not np.isfinite(epoch_values).any():

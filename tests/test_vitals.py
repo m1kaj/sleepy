@@ -45,6 +45,15 @@ def test_flat_noise_has_no_confidence():
     assert confidence < 0.5
 
 
+def test_rate_is_not_estimated_across_a_reconnect_gap():
+    """A link loss must not be interpolated into a fake breathing rhythm."""
+    signal = _sine(0.25)
+    signal[2_000:6_000] = np.nan  # ~48 % of a 60 s window is missing
+    bpm, confidence = estimate_rate(signal, FS, BREATHING_BAND_HZ)
+    assert bpm is None
+    assert confidence == 0.0
+
+
 def test_process_channel_produces_epochs():
     """A whole night in bed: the DC level is high and stays high."""
     times = np.arange(int(300 * FS)) / FS

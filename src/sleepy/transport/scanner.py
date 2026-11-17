@@ -24,6 +24,9 @@ class DiscoveredDevice:
     manufacturer_data: dict[str, str] = field(default_factory=dict)
     service_data: dict[str, str] = field(default_factory=dict)
     is_beddit: bool = False
+    #: The raw bleak ``BLEDevice``. Keeping it lets a reconnect use BlueZ's
+    #: cached D-Bus object instead of scanning for an advertisement again.
+    ble_device: object | None = field(default=None, repr=False)
 
     def __str__(self) -> str:
         rssi = "-" if self.rssi is None else f"{self.rssi} dBm"
@@ -58,6 +61,7 @@ async def scan(
                 },
                 service_data={key: value.hex() for key, value in adv.service_data.items()},
                 is_beddit=name.startswith(BEDDIT_NAME_PREFIX),
+                ble_device=device,
             )
         )
 
